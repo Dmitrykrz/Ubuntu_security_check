@@ -106,6 +106,8 @@ for user in $users; do
 done
 echo -e "${ORANGE}== List of users with root priveleges ==${NC}"
 awk -F: '$3 == 0 {printf "\033[0;35m%s\033[0m\n", $1}' /etc/passwd
+grep -E '^sudo|^admin' /etc/group | awk -F':' '{print "\033[35m" $4 "\033[0m"}' | tr ',' '\n'
+
 
 echo -e "${ORANGE}======== List of opened ports =========${NC}"
 netstat -tulnp | grep '^tcp' | awk '{print $4, $7}' | cut -d':' -f2- | awk '{split($2, a, "/"); printf "\033[31m%s\033[0m %s\n", $1, a[2]}'
