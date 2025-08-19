@@ -12,7 +12,14 @@ fi
 
 echo ""
 echo ""
+echo -e "${ORANGE}=====================================${NC}"
 echo -e "${ORANGE}==== Basic security check script ====${NC}"
+echo -e "${ORANGE}=====================================${NC}"
+
+echo -e "\e[31m$(grep PRETTY /etc/os-release | cut -d= -f2 | tr -d '"')\e[0m"
+echo -e "IP  \e[31m$(hostname -I | awk '{print $1}')\e[0m"
+
+
 
 # Root login check
 root_login=$(grep -E '^PermitRootLogin (yes|no|Yes|No|YES|NO)' /etc/ssh/sshd_config | awk '{print $2}')
@@ -72,8 +79,9 @@ else
     ssh_port="$ssh_port_line"
     echo -e "${GREEN}OK:${NC} SSH is running on port ${ssh_port} ${GREEN}✓${NC}"
 fi
+echo -e "${ORANGE}=====================================${NC}"
 echo -e "${ORANGE}========= User Access Table =========${NC}"
-
+echo -e "${ORANGE}=====================================${NC}"
 # Header
 printf "%-20s %-15s %-10s\n" "User" "Has Pass" "Has Key"
 echo "--------------------------------------------"
@@ -104,13 +112,34 @@ for user in $users; do
     printf "%-20s %-15s %-10s\n" "$user" "$has_pass" "$has_keys"
 
 done
+echo -e "${ORANGE}========================================${NC}"
 echo -e "${ORANGE}== List of users with root priveleges ==${NC}"
+echo -e "${ORANGE}========================================${NC}"
 awk -F: '$3 == 0 {printf "\033[0;35m%s\033[0m\n", $1}' /etc/passwd
 grep -E '^sudo|^admin' /etc/group | awk -F':' '{print "\033[35m" $4 "\033[0m"}' | tr ',' '\n'
-
-
+echo -e "${ORANGE}=======================================${NC}"
 echo -e "${ORANGE}======== List of opened ports =========${NC}"
-netstat -tulnp | grep '^tcp' | awk '{print $4, $7}' | cut -d':' -f2- | awk '{split($2, a, "/"); printf "\033[31m%s\033[0m %s\n", $1, a[2]}'
+echo -e "${ORANGE}=======================================${NC}"
+#netstat -tulnp | grep '^tcp' | awk '{print $4, $7}' | cut -d':' -f2- | awk '{split($2, a, "/"); printf "\033[31m%s\033[0m %s\n", $1, a[2]}'
+netstat -tulpn |grep tcp | awk '{print  $4, $7}'| grep '0.0.0.0'| awk '/0.0.0.0|:::/ {sub(/^.*:/, "", $1); print "\033[31m" $1 "\033[0m", $2}'
+
+
+if sudo ufw status | grep -q "Status: active"; then
+  echo -e "${ORANGE}=======================================${NC}"
+  echo -e "${ORANGE}======== Allowed ports in ufw =========${NC}"
+  echo -e "${ORANGE}=======================================${NC}"
+  sudo ufw status | grep 'ALLOW' | grep -v 'v6' | awk '{print $1}' | sed 's/\/tcp//' | awk '{print "\033[32m" $0 "\033[0m"}'
+
+
+fi
+
+
+if command -v docker >/dev/null 2>&1; then
+ echo -e "${ORANGE}=======================================${NC}"
+ echo -e "${ORANGE}=========== Running dockers ===========${NC}"
+ echo -e "${ORANGE}=======================================${NC}"
+ docker ps --format "{{.Names}}\t{{.Image}}\t{{.Ports}}" | awk '{print "\033[32m" $1 "\033[0m", "\033[33m" $2 "\033[0m", $3}'
+fi
 
 echo ""
 echo ""
