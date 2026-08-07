@@ -34,8 +34,9 @@ else
     echo -e "${GREEN}OK:${NC} Password authentication is disabled ${GREEN}✓${NC}"
 fi
 
-# UFW check
-if sudo ufw status | grep -q "Status: active"; then
+# UFW check - read the status once, it is needed again for the rules table
+ufw_status=$(sudo ufw status 2>/dev/null)
+if echo "$ufw_status" | grep -q "Status: active"; then
   echo -e "${GREEN}OK:${NC} UFW running ${GREEN}✓${NC}"
 else
  echo -e "${RED}WARNING:${NC} UFW is not running ${RED}✗${NC}"
@@ -43,8 +44,25 @@ fi
 
 # fail2ban check
 if command -v fail2ban-client >/dev/null 2>&1 && sudo fail2ban-client status >/dev/null 2>&1; then
-    jail_count=$(sudo fail2ban-client status | awk -F':' '/Number of jail/ {gsub(/[ \t]/,"",$2); print $2}')
-    echo -e "${GREEN}OK:${NC} fail2ban running with ${jail_count} jails ${GREEN}✓${NC}"
+    f2b_status=$(sudo fail2ban-client status)
+    jail_count=$(echo "$f2b_status" | awk -F':' '/Number of jail/ {gsub(/[ \t]/,"",$2); print $2}')
+
+    # Per-jail counters have to be summed - the overall status has no totals.
+    # "Total banned" is cumulative since the fail2ban service last started.
+    jails=$(echo "$f2b_status" | awk -F':' '/Jail list/ {gsub(/[ \t]/,"",$2); print $2}' | tr ',' ' ')
+    banned_now=0
+    banned_total=0
+    for jail in $jails; do
+        jail_status=$(sudo fail2ban-client status "$jail" 2>/dev/null)
+        n=$(echo "$jail_status" | awk -F':' '/Currently banned/ {gsub(/[ \t]/,"",$2); print $2}')
+        t=$(echo "$jail_status" | awk -F':' '/Total banned/     {gsub(/[ \t]/,"",$2); print $2}')
+        [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        [[ "$t" =~ ^[0-9]+$ ]] || t=0
+        banned_now=$(( banned_now + n ))
+        banned_total=$(( banned_total + t ))
+    done
+
+    echo -e "${GREEN}OK:${NC} fail2ban running with ${jail_count} jails - ${banned_now} IPs banned now, ${banned_total} total ${GREEN}✓${NC}"
 else
     echo -e "${RED}WARNING:${NC} fail2ban is not running ${RED}✗${NC}"
 fi
@@ -71,20 +89,33 @@ else
     echo -e "${GREEN}OK:${NC} No reboot required ${GREEN}✓${NC}"
 fi
 
-# SSH port check (effective config)
-ssh_port=$(echo "$sshd_effective" | awk '/^port / {print $2; exit}')
-if [[ -z "$ssh_port" || "$ssh_port" == "22" ]]; then
+# SSH port check. With socket activation (Ubuntu 22.10+) the port is set by
+# ssh.socket and sshd_config is ignored - `sshd -T` still reports 22 there,
+# so ask the socket unit first and only fall back to sshd's own config.
+ssh_ports=""
+if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    # Listen=[::]:2222 (Stream) - several entries may share one line
+    ssh_ports=$(systemctl show ssh.socket -p Listen --value 2>/dev/null \
+                | grep -oE '[^ ]+ \(Stream\)' | sed 's/ (Stream)//' | awk -F: '{print $NF}')
+fi
+if [[ -z "$ssh_ports" ]]; then
+    ssh_ports=$(echo "$sshd_effective" | awk '/^port / {print $2}')
+fi
+ssh_ports=$(echo "$ssh_ports" | sort -nu | tr '\n' ' ' | sed 's/ *$//')
+
+if [[ -z "$ssh_ports" ]]; then
+    echo -e "${RED}WARNING:${NC} Could not determine the SSH port ${RED}✗${NC}"
+elif [[ " $ssh_ports " == *" 22 "* ]]; then
     echo -e "${RED}WARNING:${NC} SSH is running on the default port 22 ${RED}✗${NC}"
-    ssh_port="22"
 else
-    echo -e "${GREEN}OK:${NC} SSH is running on port ${ssh_port} ${GREEN}✓${NC}"
+    echo -e "${GREEN}OK:${NC} SSH is running on port ${ssh_ports} ${GREEN}✓${NC}"
 fi
 
 echo -e "${ORANGE}=====================================${NC}"
 echo -e "${ORANGE}========= User Access Table =========${NC}"
 echo -e "${ORANGE}=====================================${NC}"
 # Header
-printf "%-20s %-15s %-10s\n" "User" "Has Pass" "Has Key"
+printf "%-20s %-15s %-10s\n" "User" "Has Pass" "Keys"
 echo "--------------------------------------------"
 # Users with login shells
 users=$(getent passwd | awk -F: '$7 ~ /(bash|sh|zsh)/ { print $1 }')
@@ -99,12 +130,18 @@ for user in $users; do
         has_pass="✓"
     fi
 
-    # Check for authorized_keys (home dir from passwd, no eval)
+    # Count authorized keys (home dir from passwd, no eval).
+    # Read with sudo - other users' ~/.ssh is 0700, so a plain test would
+    # report "no key" for everyone but the user running the script.
     home_dir=$(getent passwd "$user" | cut -d: -f6)
     key_file="$home_dir/.ssh/authorized_keys"
 
-    if [[ -f "$key_file" && -s "$key_file" ]]; then
-        has_keys="✓"
+    # one key per line, skipping blanks and comments
+    key_count=$(sudo grep -cvE '^[[:space:]]*(#|$)' "$key_file" 2>/dev/null)
+    [[ "$key_count" =~ ^[0-9]+$ ]] || key_count=0
+
+    if [[ "$key_count" -gt 0 ]]; then
+        has_keys="$key_count"
     else
         has_keys="✗"
     fi
@@ -128,22 +165,73 @@ sudo ss -tulnp | awk '
     $5 ~ /^(0\.0\.0\.0|\[::\]|\*):[0-9]+$/ {
         split($5, a, ":"); port = a[length(a)]
         proc = "-"
-        if (match($0, /users:\(\("[^"]+"/)) { proc = substr($0, RSTART+9, RLENGTH-9) }
+        # match spans users:(("name" - skip the 9-char prefix, drop the closing quote
+        if (match($0, /users:\(\("[^"]+"/)) { proc = substr($0, RSTART+9, RLENGTH-10) }
         printf "%s %s %s\n", port, $1, proc
     }' | sort -n -u | awk '{printf "\033[31m%s\033[0m %s %s\n", $1, $2, $3}'
 
-if sudo ufw status | grep -q "Status: active"; then
+if echo "$ufw_status" | grep -q "Status: active"; then
   echo -e "${ORANGE}=======================================${NC}"
-  echo -e "${ORANGE}======== Allowed ports in ufw =========${NC}"
+  echo -e "${ORANGE}============== ufw rules ==============${NC}"
   echo -e "${ORANGE}=======================================${NC}"
-  sudo ufw status | grep 'ALLOW' | grep -v 'v6' | awk '{print $1}' | sed 's/\/tcp//' | awk '{print "\033[32m" $0 "\033[0m"}'
+  # Grepping only ALLOW hid the other actions - notably LIMIT, which is how
+  # `ufw limit 22/tcp` (the usual SSH rule) shows up. Skip the (v6) duplicates.
+  # Lines are "<to> <ACTION> IN <from>", where <to> may be several words
+  # ("Anywhere on docker0") and is just "Anywhere" for source-based rules -
+  # for those the From column is the only part that carries any meaning.
+  printf "%-16s %-7s %s\n" "To" "Action" "From"
+  echo "--------------------------------------------"
+  echo "$ufw_status" | awk '
+      /\(v6\)/ { next }
+      # fail2ban writes one REJECT rule per banned IP - dozens of them, all
+      # transient. The jail counts above already summarise them.
+      /by Fail2Ban/ { next }
+      {
+          ai = 0
+          for (i = 1; i <= NF; i++) if ($i ~ /^(ALLOW|DENY|REJECT|LIMIT)$/) { ai = i; break }
+          if (ai == 0) next
+
+          to = ""
+          for (i = 1; i < ai; i++) to = to (to == "" ? "" : " ") $i
+          if (to !~ / /) sub(/\/(tcp|udp)$/, "", to)
+
+          from = ""
+          start = ($(ai+1) ~ /^(IN|OUT)$/) ? ai + 2 : ai + 1
+          for (i = start; i <= NF; i++) from = from (from == "" ? "" : " ") $i
+
+          printf "%s|%s|%s\n", to, $ai, from
+      }' | awk -F'|' '!seen[$0]++ {
+          col = ($2 == "DENY" || $2 == "REJECT") ? "33" : "32"
+          printf "\033[0;32m%-16s\033[0m \033[0;%sm%-7s\033[0m %s\n", $1, col, $2, $3
+      }'
+
+  f2b_rules=$(echo "$ufw_status" | grep -c 'by Fail2Ban')
+  if [[ "$f2b_rules" -gt 0 ]]; then
+      echo -e "${ORANGE}(+ ${f2b_rules} transient fail2ban ban rules, hidden)${NC}"
+  fi
 fi
 
 if command -v docker >/dev/null 2>&1; then
  echo -e "${ORANGE}=======================================${NC}"
  echo -e "${ORANGE}=========== Running dockers ===========${NC}"
  echo -e "${ORANGE}=======================================${NC}"
- docker ps --format "{{.Names}}\t{{.Image}}\t{{.Ports}}" | awk '{print "\033[32m" $1 "\033[0m", "\033[33m" $2 "\033[0m", $3}'
+ # -F'\t' matters: the ports string contains ", " separators, so splitting on
+ # plain whitespace truncates multi-port containers (mysql loses 33060/tcp).
+ docker_out=$(docker ps --format "{{.Names}}\t{{.Image}}\t{{.Ports}}")
+ echo "$docker_out" | awk -F'\t' '{
+     # A publish on 0.0.0.0 / [::] is reachable from the internet even when ufw
+     # denies the port - Dockers chain is evaluated before ufws INPUT rules.
+     exposed = ($3 ~ /(0\.0\.0\.0|\[::\]):[0-9]+->/)
+     printf "\033[0;32m%-26s\033[0m \033[0;33m%-24s\033[0m %s%s\033[0m\n", \
+            $1, $2, (exposed ? "\033[0;31m" : ""), $3
+ }'
+
+ if echo "$docker_out" | grep -qE '(0\.0\.0\.0|\[::\]):[0-9]+->'; then
+     echo -e "${RED}WARNING:${NC} ports above in ${RED}red${NC} are published on all interfaces."
+     echo -e "         Docker writes its own iptables rules ahead of ufw, so these are"
+     echo -e "         reachable from the internet ${RED}even if ufw denies them${NC}."
+     echo -e "         Bind to localhost instead (127.0.0.1:8080:80) if fronted by a proxy. ${RED}✗${NC}"
+ fi
 fi
 
 echo ""
