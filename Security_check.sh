@@ -232,6 +232,253 @@ if command -v docker >/dev/null 2>&1; then
      echo -e "         reachable from the internet ${RED}even if ufw denies them${NC}."
      echo -e "         Bind to localhost instead (127.0.0.1:8080:80) if fronted by a proxy. ${RED}✗${NC}"
  fi
+
+ if [[ -n "$docker_out" ]]; then
+  echo -e "${ORANGE}=======================================${NC}"
+  echo -e "${ORANGE}========== Docker resources ===========${NC}"
+  echo -e "${ORANGE}=======================================${NC}"
+  # Usage comes from docker stats, limits from docker inspect, ports from
+  # docker ps. Each line is tagged with its source and all go through one awk
+  # (mawk, Ubuntu's default awk, has no ARGIND to tell several files apart).
+  # Stats come last, so limits and ports are already known when a row prints.
+  host_cpus=$(nproc)
+  host_mem=$(free -h | awk '/^Mem:/ {print $2}')
+  printf "%-26s %-18s %-30s %s\n" "Container" "CPU" "Memory" "Host ports"
+  echo "--------------------------------------------------------------------------------"
+  {
+   docker inspect --format 'L|{{.Name}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.CpuQuota}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.Memory}}' $(docker ps -q)
+   docker ps --format 'P|{{.Names}}|{{.Ports}}'
+   docker stats --no-stream --format 'S|{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}'
+  } 2>/dev/null | awk -F'|' -v ncpu="$host_cpus" '
+      # green -> yellow at 50% -> orange at 75% -> red at 90% (256-color codes)
+      function shade(p) {
+          if (p >= 90)   return 196
+          if (p >= 82.5) return 208
+          if (p >= 75)   return 214
+          if (p >= 62.5) return 220
+          if (p >= 50)   return 226
+          if (p >= 37.5) return 190
+          if (p >= 25)   return 154
+          if (p >= 12.5) return 118
+          return 46
+      }
+      function pct(p) { return sprintf("\033[38;5;%sm%4s\033[0m", shade(p), int(p + 0.5) "%") }
+      # Host side of each publish: red bare port = all interfaces, green = bound to one IP
+      function host_ports(s,   n, a, i, b, out, seen) {
+          n = split(s, a, ", ")
+          out = ""
+          for (i = 1; i <= n; i++) {
+              if (a[i] !~ /->/) continue
+              b = a[i]; sub(/->.*/, "", b)
+              if (b ~ /^(0\.0\.0\.0|\[::\]):/) { sub(/.*:/, "", b); b = "\033[0;31m" b "\033[0m" }
+              else b = "\033[0;32m" b "\033[0m"
+              if (b in seen) continue
+              seen[b] = 1
+              out = out (out == "" ? "" : " ") b
+          }
+          return out == "" ? "-" : out
+      }
+      $1 == "L" {
+          name = $2; sub(/^\//, "", name)
+          # --cpus sets NanoCpus; the older --cpu-quota/--cpu-period pair is the same limit
+          if ($3 > 0)      cpu_lim[name] = $3 / 1e9
+          else if ($4 > 0) cpu_lim[name] = $4 / ($5 > 0 ? $5 : 100000)
+          mem_lim[name] = $6
+          next
+      }
+      $1 == "P" { ports[$2] = $3; next }
+      $1 == "S" {
+          name = $2
+          # CPUPerc is relative to ONE core (200% = 2 CPUs busy)
+          cpu = $3; gsub(/%/, "", cpu); cpu += 0
+          if (cpu_lim[name] > 0) { cpu_p = cpu / cpu_lim[name]; cpu_note = sprintf("of %g CPU", cpu_lim[name]) }
+          else                   { cpu_p = cpu / ncpu;          cpu_note = "no limit" }
+          # MemPerc is already used/limit, or used/host RAM when there is no limit
+          mem = $5; gsub(/%/, "", mem); mem += 0
+          split($4, mu, " / ")
+          mem_note = (mem_lim[name] > 0) ? mu[1] " / " mu[2] : mu[1] " no limit"
+          printf "\033[0;32m%-26s\033[0m %s %-13s %s %-25s %s\n", \
+                 name, pct(cpu_p), cpu_note, pct(mem), mem_note, host_ports(ports[name])
+      }'
+  echo -e "${ORANGE}(no limit = share of the whole host: ${host_cpus} CPUs, ${host_mem} RAM)${NC}"
+ fi
+fi
+
+# Turns "host<TAB>path<TAB>target" lines into the routing recap
+print_routes() {
+    sort -u | awk -F'\t' '{
+        printf "\033[0;32m%-40s\033[0m → \033[0;33m%s\033[0m\n", $1 ($2 == "/" ? "" : $2), $3
+    }'
+}
+
+web_found=0
+if systemctl is-active --quiet nginx 2>/dev/null; then
+ web_found=1
+ echo -e "${ORANGE}=======================================${NC}"
+ echo -e "${ORANGE}============ Hosts (nginx) ============${NC}"
+ echo -e "${ORANGE}=======================================${NC}"
+ # Flatten the config into one statement per line - each ends in "{", "}" or
+ # ";" - so the block structure can be tracked whatever the formatting.
+ # Only locations directly inside a server block are looked at. Servers with a
+ # server-level return (http->https redirects, 444 catch-alls) serve nothing.
+ # Tabs are flattened too, so a tab can safely separate the output fields.
+ nginx_routes=$(sudo cat /etc/nginx/sites-enabled/* 2>/dev/null \
+   | sed 's/#.*//' | tr '\n\t\r' '   ' | sed 's/[{};]/&\n/g' \
+   | awk '
+       function strip(u) {   # http://127.0.0.1:3000/x -> 127.0.0.1:3000
+           sub(/^[a-z]+:\/\//, "", u)
+           if (u !~ /^unix:/) sub(/\/.*/, "", u)
+           return u
+       }
+       function close_location() {
+           if (path ~ /^@/) return
+           if (path == "/") slash = 1
+           if (proxy != "")    t = "proxy:" proxy
+           else if (regex)     return   # e.g. the \.php$ -> fastcgi handler
+           else if (lroot != "") t = lroot
+           else if (ret)       return
+           else if (path == "/") t = "@root"
+           else return                  # same root as the server, nothing new
+           lp[++nloc] = regex ? " ~ " path : path
+           lt[nloc] = t
+       }
+       function close_server(   n, a, i, host, t) {
+           if (redirect) return
+           n = split(names, a, " ")
+           host = (n == 0) ? "(no server_name)" : (a[1] == "_" ? "_ (default)" : a[1])
+           if (!slash && sroot != "") { lp[++nloc] = "/"; lt[nloc] = "@root" }
+           for (i = 1; i <= nloc; i++) {
+               t = lt[i]
+               if (t == "@root") { if (sroot == "") continue; t = sroot }
+               rows[++nrows] = host "\t" lp[i] "\t" t
+           }
+       }
+       {
+           sub(/^ +/, ""); sub(/ +$/, "")
+           if ($0 == "") next
+           end = substr($0, length($0))
+           if (end == "{") {
+               sub(/ *\{$/, "")
+               kind[++depth] = $1
+               if ($1 == "server") { names = ""; sroot = ""; redirect = 0; slash = 0; nloc = 0 }
+               else if ($1 == "location" && kind[depth-1] == "server") {
+                   regex = ($2 ~ /^~/)
+                   path = ($2 ~ /^(=|\^~|~|~\*)$/) ? $3 : $2
+                   if (regex && path == $2) sub(/^~\*?/, "", path)   # "~\.php$" without a space
+                   proxy = ""; lroot = ""; ret = 0
+               }
+               else if ($1 == "upstream") up = $2
+               next
+           }
+           if (end == "}") {
+               if (kind[depth] == "location" && kind[depth-1] == "server") close_location()
+               else if (kind[depth] == "server") close_server()
+               depth--
+               next
+           }
+           sub(/ *;$/, "")
+           if (kind[depth] == "upstream" && $1 == "server") {
+               if (up in upstream) upcount[up]++
+               else upstream[up] = $2
+           }
+           else if (kind[depth] == "server") {
+               if ($1 == "server_name") for (i = 2; i <= NF; i++) names = names " " $i
+               else if ($1 == "root") sroot = $2
+               else if ($1 == "return") redirect = 1
+           }
+           else if (kind[depth] == "location" && kind[depth-1] == "server") {
+               if ($1 == "proxy_pass") proxy = $2
+               else if ($1 == "root" || $1 == "alias") lroot = $2
+               else if ($1 == "return") ret = 1
+           }
+       }
+       END {
+           # upstream blocks may come after the servers that use them
+           for (i = 1; i <= nrows; i++) {
+               split(rows[i], r, "\t")
+               t = r[3]
+               if (t ~ /^proxy:/) {
+                   t = strip(substr(t, 7))
+                   if (t in upstream) t = upstream[t] ((t in upcount) ? " +" upcount[t] : "")
+               }
+               print r[1] "\t" r[2] "\t" t
+           }
+       }')
+ if [[ -n "$nginx_routes" ]]; then
+     echo "$nginx_routes" | print_routes
+ else
+     echo "No sites found in /etc/nginx/sites-enabled"
+ fi
+fi
+
+if systemctl is-active --quiet apache2 2>/dev/null; then
+ web_found=1
+ echo -e "${ORANGE}=======================================${NC}"
+ echo -e "${ORANGE}=========== Hosts (apache2) ===========${NC}"
+ echo -e "${ORANGE}=======================================${NC}"
+ # One block per <VirtualHost>. A vhost that redirects (the certbot :80 one)
+ # has its DocumentRoot skipped - the :443 twin already reports it.
+ apache_routes=$(sudo cat /etc/apache2/sites-enabled/* 2>/dev/null \
+   | sed 's/#.*//' | tr -d '\r' \
+   | awk '
+       function strip(u) {
+           gsub(/"/, "", u)
+           sub(/^[a-z]+:\/\//, "", u)
+           if (u !~ /^unix:/) sub(/\/.*/, "", u)
+           return u
+       }
+       function unquote(s) { gsub(/"/, "", s); if (s != "/") sub(/\/$/, "", s); return s }
+       # "^", "^/(.*)$", "(.*)" and the like match every URL of the site
+       function whole_site(re) { return re ~ /^\^?\/?\??(\(\.\*\))?\$?$/ }
+       { d = tolower($1) }
+       d ~ /^<virtualhost/ { inv = 1; host = ""; droot = ""; redirect = 0; slash = 0; n = 0; lpath = ""; next }
+       # Alias / ProxyPass outside any <VirtualHost> (e.g. nextcloud.conf) apply to every vhost
+       !inv {
+           if (d == "alias") print "* (all vhosts)\t" unquote($2) "\t" unquote($3)
+           else if (d == "proxypass" && $3 != "!") print "* (all vhosts)\t" $2 "\t" strip($3)
+           next
+       }
+       d == "</virtualhost>" {
+           inv = 0
+           if (host == "") host = "(no ServerName)"
+           if (!slash && droot != "" && !redirect) { p[++n] = "/"; t[n] = droot }
+           for (i = 1; i <= n; i++) print host "\t" p[i] "\t" t[i]
+           next
+       }
+       d ~ /^<location/  { lpath = $2; sub(/>$/, "", lpath); gsub(/"/, "", lpath); next }
+       d == "</location>" { lpath = ""; next }
+       d == "servername"   { host = $2; next }
+       d == "documentroot" { droot = $2; gsub(/"/, "", droot); next }
+       # Only a redirect of the whole site hides the DocumentRoot - not partial
+       # ones like Redirect 301 /.well-known/caldav ... (status is optional, first)
+       d == "redirect" || d == "redirectmatch" {
+           rp = ($2 ~ /^([0-9]+|permanent|temp|seeother|gone)$/) ? $3 : $2
+           if (d == "redirect" ? rp == "/" : whole_site(rp)) redirect = 1
+           next
+       }
+       d == "rewriterule" && tolower($NF) ~ /(\[|,)r(=[^],]*)?(,|\])/ { if (whole_site($2)) redirect = 1; next }
+       d == "proxypass" {
+           # inside <Location /x> the path is implied: ProxyPass http://...
+           if (lpath != "") { path = lpath; url = $2 } else { path = $2; url = $3 }
+           if (url == "!") next
+           if (path == "/") slash = 1
+           p[++n] = path; t[n] = strip(url)
+           next
+       }
+       d == "alias" { p[++n] = unquote($2); t[n] = unquote($3); next }
+   ')
+ if [[ -n "$apache_routes" ]]; then
+     echo "$apache_routes" | print_routes
+ else
+     echo "No sites found in /etc/apache2/sites-enabled"
+ fi
+fi
+
+if [[ "$web_found" -eq 0 ]]; then
+ echo -e "${ORANGE}=======================================${NC}"
+ echo -e "${ORANGE}================ Hosts ================${NC}"
+ echo -e "${ORANGE}=======================================${NC}"
+ echo "Neither nginx nor apache2 is active"
 fi
 
 echo ""
