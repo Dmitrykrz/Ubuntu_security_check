@@ -427,9 +427,17 @@ if systemctl is-active --quiet apache2 2>/dev/null; then
            if (u !~ /^unix:/) sub(/\/.*/, "", u)
            return u
        }
+       function unquote(s) { gsub(/"/, "", s); if (s != "/") sub(/\/$/, "", s); return s }
+       # "^", "^/(.*)$", "(.*)" and the like match every URL of the site
+       function whole_site(re) { return re ~ /^\^?\/?\??(\(\.\*\))?\$?$/ }
        { d = tolower($1) }
        d ~ /^<virtualhost/ { inv = 1; host = ""; droot = ""; redirect = 0; slash = 0; n = 0; lpath = ""; next }
-       !inv { next }
+       # Alias / ProxyPass outside any <VirtualHost> (e.g. nextcloud.conf) apply to every vhost
+       !inv {
+           if (d == "alias") print "* (all vhosts)\t" unquote($2) "\t" unquote($3)
+           else if (d == "proxypass" && $3 != "!") print "* (all vhosts)\t" $2 "\t" strip($3)
+           next
+       }
        d == "</virtualhost>" {
            inv = 0
            if (host == "") host = "(no ServerName)"
@@ -441,8 +449,14 @@ if systemctl is-active --quiet apache2 2>/dev/null; then
        d == "</location>" { lpath = ""; next }
        d == "servername"   { host = $2; next }
        d == "documentroot" { droot = $2; gsub(/"/, "", droot); next }
-       d == "redirect" || d == "redirectmatch" { redirect = 1; next }
-       d == "rewriterule" && tolower($NF) ~ /(\[|,)r(=[^],]*)?(,|\])/ { redirect = 1; next }
+       # Only a redirect of the whole site hides the DocumentRoot - not partial
+       # ones like Redirect 301 /.well-known/caldav ... (status is optional, first)
+       d == "redirect" || d == "redirectmatch" {
+           rp = ($2 ~ /^([0-9]+|permanent|temp|seeother|gone)$/) ? $3 : $2
+           if (d == "redirect" ? rp == "/" : whole_site(rp)) redirect = 1
+           next
+       }
+       d == "rewriterule" && tolower($NF) ~ /(\[|,)r(=[^],]*)?(,|\])/ { if (whole_site($2)) redirect = 1; next }
        d == "proxypass" {
            # inside <Location /x> the path is implied: ProxyPass http://...
            if (lpath != "") { path = lpath; url = $2 } else { path = $2; url = $3 }
@@ -451,7 +465,7 @@ if systemctl is-active --quiet apache2 2>/dev/null; then
            p[++n] = path; t[n] = strip(url)
            next
        }
-       d == "alias" { a1 = $2; a2 = $3; gsub(/"/, "", a1); gsub(/"/, "", a2); p[++n] = a1; t[n] = a2; next }
+       d == "alias" { p[++n] = unquote($2); t[n] = unquote($3); next }
    ')
  if [[ -n "$apache_routes" ]]; then
      echo "$apache_routes" | print_routes
