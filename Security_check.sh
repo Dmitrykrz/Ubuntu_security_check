@@ -330,11 +330,18 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
            if (u !~ /^unix:/) sub(/\/.*/, "", u)
            return u
        }
+       function resolve(u) {   # upstream name -> its first server (+N more)
+           u = strip(u)
+           if (u in upstream) u = upstream[u] ((u in upcount) ? " +" upcount[u] : "")
+           return u
+       }
        function close_location() {
            if (path ~ /^@/) return
            if (path == "/") slash = 1
-           if (proxy != "")    t = "proxy:" proxy
-           else if (regex)     return   # e.g. the \.php$ -> fastcgi handler
+           # the classic \.php$ -> fastcgi handler: noted next to the site root
+           if (pass != "" && regex && ptype == "fastcgi") { php = pass; return }
+           if (pass != "")     t = "pass:" ptype " " pass
+           else if (regex)     return
            else if (lroot != "") t = lroot
            else if (ret)       return
            else if (path == "/") t = "@root"
@@ -349,7 +356,7 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
            if (!slash && sroot != "") { lp[++nloc] = "/"; lt[nloc] = "@root" }
            for (i = 1; i <= nloc; i++) {
                t = lt[i]
-               if (t == "@root") { if (sroot == "") continue; t = sroot }
+               if (t == "@root") { if (sroot == "") continue; t = sroot "\t" php }
                rows[++nrows] = host "\t" lp[i] "\t" t
            }
        }
@@ -360,12 +367,12 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
            if (end == "{") {
                sub(/ *\{$/, "")
                kind[++depth] = $1
-               if ($1 == "server") { names = ""; sroot = ""; redirect = 0; slash = 0; nloc = 0 }
+               if ($1 == "server") { names = ""; sroot = ""; php = ""; redirect = 0; slash = 0; nloc = 0 }
                else if ($1 == "location" && kind[depth-1] == "server") {
                    regex = ($2 ~ /^~/)
                    path = ($2 ~ /^(=|\^~|~|~\*)$/) ? $3 : $2
                    if (regex && path == $2) sub(/^~\*?/, "", path)   # "~\.php$" without a space
-                   proxy = ""; lroot = ""; ret = 0
+                   pass = ""; ptype = ""; lroot = ""; ret = 0
                }
                else if ($1 == "upstream") up = $2
                next
@@ -387,7 +394,8 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
                else if ($1 == "return") redirect = 1
            }
            else if (kind[depth] == "location" && kind[depth-1] == "server") {
-               if ($1 == "proxy_pass") proxy = $2
+               # fastcgi_pass in location / is a front controller - PHP gets every request
+               if ($1 ~ /^(proxy|fastcgi|uwsgi|scgi|grpc)_pass$/) { pass = $2; ptype = $1; sub(/_pass$/, "", ptype) }
                else if ($1 == "root" || $1 == "alias") lroot = $2
                else if ($1 == "return") ret = 1
            }
@@ -397,10 +405,12 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
            for (i = 1; i <= nrows; i++) {
                split(rows[i], r, "\t")
                t = r[3]
-               if (t ~ /^proxy:/) {
-                   t = strip(substr(t, 7))
-                   if (t in upstream) t = upstream[t] ((t in upcount) ? " +" upcount[t] : "")
+               if (t ~ /^pass:/) {
+                   t = substr(t, 6); ty = t
+                   sub(/ .*/, "", ty); sub(/^[^ ]* /, "", t)
+                   t = resolve(t) (ty == "proxy" ? "" : " (" ty ")")
                }
+               if (r[4] != "") t = t " (php: " resolve(r[4]) ")"
                print r[1] "\t" r[2] "\t" t
            }
        }')
@@ -431,7 +441,7 @@ if systemctl is-active --quiet apache2 2>/dev/null; then
        # "^", "^/(.*)$", "(.*)" and the like match every URL of the site
        function whole_site(re) { return re ~ /^\^?\/?\??(\(\.\*\))?\$?$/ }
        { d = tolower($1) }
-       d ~ /^<virtualhost/ { inv = 1; host = ""; droot = ""; redirect = 0; slash = 0; n = 0; lpath = ""; next }
+       d ~ /^<virtualhost/ { inv = 1; host = ""; droot = ""; php = ""; redirect = 0; slash = 0; n = 0; lpath = ""; next }
        # Alias / ProxyPass outside any <VirtualHost> (e.g. nextcloud.conf) apply to every vhost
        !inv {
            if (d == "alias") print "* (all vhosts)\t" unquote($2) "\t" unquote($3)
@@ -441,7 +451,7 @@ if systemctl is-active --quiet apache2 2>/dev/null; then
        d == "</virtualhost>" {
            inv = 0
            if (host == "") host = "(no ServerName)"
-           if (!slash && droot != "" && !redirect) { p[++n] = "/"; t[n] = droot }
+           if (!slash && droot != "" && !redirect) { p[++n] = "/"; t[n] = droot (php != "" ? " (php: " php ")" : "") }
            for (i = 1; i <= n; i++) print host "\t" p[i] "\t" t[i]
            next
        }
@@ -449,6 +459,8 @@ if systemctl is-active --quiet apache2 2>/dev/null; then
        d == "</location>" { lpath = ""; next }
        d == "servername"   { host = $2; next }
        d == "documentroot" { droot = $2; gsub(/"/, "", droot); next }
+       # PHP-FPM per vhost: SetHandler "proxy:unix:/run/php/php8.3-fpm.sock|fcgi://localhost"
+       d == "sethandler" && $2 ~ /proxy:/ { php = $2; gsub(/"/, "", php); sub(/^proxy:/, "", php); sub(/\|.*/, "", php); next }
        # Only a redirect of the whole site hides the DocumentRoot - not partial
        # ones like Redirect 301 /.well-known/caldav ... (status is optional, first)
        d == "redirect" || d == "redirectmatch" {
