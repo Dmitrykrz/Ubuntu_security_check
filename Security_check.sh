@@ -10,8 +10,25 @@ echo -e "${ORANGE}=====================================${NC}"
 echo -e "${ORANGE}==== Basic security check script ====${NC}"
 echo -e "${ORANGE}=====================================${NC}"
 
-echo -e "\e[31m$(grep PRETTY /etc/os-release | cut -d= -f2 | tr -d '"')\e[0m"
-echo -e "IP  \e[31m$(hostname -I | awk '{print $1}')\e[0m"
+echo -e "${GREEN}$(grep PRETTY /etc/os-release | cut -d= -f2 | tr -d '"')${NC}"
+echo -e "IP  $(hostname -I | awk '{print $1}')"
+
+# awk helper shared by the tables that show percentages:
+# green -> yellow at 50% -> orange at 75% -> red at 90% (256-color codes)
+AWK_SHADE='
+    function shade(p) {
+        if (p >= 90)   return 196
+        if (p >= 82.5) return 208
+        if (p >= 75)   return 214
+        if (p >= 62.5) return 220
+        if (p >= 50)   return 226
+        if (p >= 37.5) return 190
+        if (p >= 25)   return 154
+        if (p >= 12.5) return 118
+        return 46
+    }
+    function pct(p) { return sprintf("\033[38;5;%sm%4s\033[0m", shade(p), int(p + 0.5) "%") }
+'
 
 # Effective SSH settings (sshd -T resolves sshd_config.d/ drop-ins and Include)
 sshd_effective=$(sudo sshd -T 2>/dev/null)
@@ -168,7 +185,7 @@ sudo ss -tulnp | awk '
         # match spans users:(("name" - skip the 9-char prefix, drop the closing quote
         if (match($0, /users:\(\("[^"]+"/)) { proc = substr($0, RSTART+9, RLENGTH-10) }
         printf "%s %s %s\n", port, $1, proc
-    }' | sort -n -u | awk '{printf "\033[31m%s\033[0m %s %s\n", $1, $2, $3}'
+    }' | sort -u -k1,1n -k2,2 | awk '{printf "\033[31m%s\033[0m %s %s\n", $1, $2, $3}'
 
 if echo "$ufw_status" | grep -q "Status: active"; then
   echo -e "${ORANGE}=======================================${NC}"
@@ -218,13 +235,28 @@ if command -v docker >/dev/null 2>&1; then
  # -F'\t' matters: the ports string contains ", " separators, so splitting on
  # plain whitespace truncates multi-port containers (mysql loses 33060/tcp).
  docker_out=$(docker ps --format "{{.Names}}\t{{.Image}}\t{{.Ports}}")
- echo "$docker_out" | awk -F'\t' '{
-     # A publish on 0.0.0.0 / [::] is reachable from the internet even when ufw
-     # denies the port - Dockers chain is evaluated before ufws INPUT rules.
-     exposed = ($3 ~ /(0\.0\.0\.0|\[::\]):[0-9]+->/)
-     printf "\033[0;32m%-26s\033[0m \033[0;33m%-24s\033[0m %s%s\033[0m\n", \
-            $1, $2, (exposed ? "\033[0;31m" : ""), $3
- }'
+ # Two passes: column widths come from the longest name and image, so the
+ # ports column lines up however long an image reference is.
+ echo "$docker_out" | awk -F'\t' '
+     NF > 0 {
+         n++; name[n] = $1; img[n] = $2; prt[n] = ($3 == "" ? "-" : $3)
+         if (length($1) > w1) w1 = length($1)
+         if (length($2) > w2) w2 = length($2)
+     }
+     END {
+         if (n == 0) { print "No running containers"; exit }
+         if (w1 < 9) w1 = 9; if (w2 < 5) w2 = 5
+         printf "%-" w1 "s  %-" w2 "s  %s\n", "Container", "Image", "Ports"
+         line = ""; for (i = 0; i < w1 + w2 + 4 + 20; i++) line = line "-"
+         print line
+         for (i = 1; i <= n; i++) {
+             # A publish on 0.0.0.0 / [::] is reachable from the internet even when ufw
+             # denies the port - Dockers chain is evaluated before ufws INPUT rules.
+             exposed = (prt[i] ~ /(0\.0\.0\.0|\[::\]):[0-9]+->/)
+             printf "\033[0;32m%-" w1 "s\033[0m  \033[0;33m%-" w2 "s\033[0m  %s%s\033[0m\n", \
+                    name[i], img[i], (exposed ? "\033[0;31m" : ""), prt[i]
+         }
+     }'
 
  if echo "$docker_out" | grep -qE '(0\.0\.0\.0|\[::\]):[0-9]+->'; then
      echo -e "${RED}WARNING:${NC} ports above in ${RED}red${NC} are published on all interfaces."
@@ -237,47 +269,18 @@ if command -v docker >/dev/null 2>&1; then
   echo -e "${ORANGE}=======================================${NC}"
   echo -e "${ORANGE}========== Docker resources ===========${NC}"
   echo -e "${ORANGE}=======================================${NC}"
-  # Usage comes from docker stats, limits from docker inspect, ports from
-  # docker ps. Each line is tagged with its source and all go through one awk
-  # (mawk, Ubuntu's default awk, has no ARGIND to tell several files apart).
-  # Stats come last, so limits and ports are already known when a row prints.
+  # Usage comes from docker stats, limits from docker inspect (published ports
+  # are already in the table above). Each line is tagged with its source and
+  # both go through one awk (mawk, Ubuntu's default awk, has no ARGIND to tell
+  # several files apart). Stats come last, so limits are known when a row prints.
   host_cpus=$(nproc)
   host_mem=$(free -h | awk '/^Mem:/ {print $2}')
-  printf "%-26s %-18s %-30s %s\n" "Container" "CPU" "Memory" "Host ports"
-  echo "--------------------------------------------------------------------------------"
+  printf "%-26s %-18s %s\n" "Container" "CPU" "Memory"
+  echo "------------------------------------------------------------------"
   {
    docker inspect --format 'L|{{.Name}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.CpuQuota}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.Memory}}' $(docker ps -q)
-   docker ps --format 'P|{{.Names}}|{{.Ports}}'
    docker stats --no-stream --format 'S|{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}'
-  } 2>/dev/null | awk -F'|' -v ncpu="$host_cpus" '
-      # green -> yellow at 50% -> orange at 75% -> red at 90% (256-color codes)
-      function shade(p) {
-          if (p >= 90)   return 196
-          if (p >= 82.5) return 208
-          if (p >= 75)   return 214
-          if (p >= 62.5) return 220
-          if (p >= 50)   return 226
-          if (p >= 37.5) return 190
-          if (p >= 25)   return 154
-          if (p >= 12.5) return 118
-          return 46
-      }
-      function pct(p) { return sprintf("\033[38;5;%sm%4s\033[0m", shade(p), int(p + 0.5) "%") }
-      # Host side of each publish: red bare port = all interfaces, green = bound to one IP
-      function host_ports(s,   n, a, i, b, out, seen) {
-          n = split(s, a, ", ")
-          out = ""
-          for (i = 1; i <= n; i++) {
-              if (a[i] !~ /->/) continue
-              b = a[i]; sub(/->.*/, "", b)
-              if (b ~ /^(0\.0\.0\.0|\[::\]):/) { sub(/.*:/, "", b); b = "\033[0;31m" b "\033[0m" }
-              else b = "\033[0;32m" b "\033[0m"
-              if (b in seen) continue
-              seen[b] = 1
-              out = out (out == "" ? "" : " ") b
-          }
-          return out == "" ? "-" : out
-      }
+  } 2>/dev/null | awk -F'|' -v ncpu="$host_cpus" "$AWK_SHADE"'
       $1 == "L" {
           name = $2; sub(/^\//, "", name)
           # --cpus sets NanoCpus; the older --cpu-quota/--cpu-period pair is the same limit
@@ -286,7 +289,6 @@ if command -v docker >/dev/null 2>&1; then
           mem_lim[name] = $6
           next
       }
-      $1 == "P" { ports[$2] = $3; next }
       $1 == "S" {
           name = $2
           # CPUPerc is relative to ONE core (200% = 2 CPUs busy)
@@ -297,8 +299,8 @@ if command -v docker >/dev/null 2>&1; then
           mem = $5; gsub(/%/, "", mem); mem += 0
           split($4, mu, " / ")
           mem_note = (mem_lim[name] > 0) ? mu[1] " / " mu[2] : mu[1] " no limit"
-          printf "\033[0;32m%-26s\033[0m %s %-13s %s %-25s %s\n", \
-                 name, pct(cpu_p), cpu_note, pct(mem), mem_note, host_ports(ports[name])
+          printf "\033[0;32m%-26s\033[0m %s %-13s %s %s\n", \
+                 name, pct(cpu_p), cpu_note, pct(mem), mem_note
       }'
   echo -e "${ORANGE}(no limit = share of the whole host: ${host_cpus} CPUs, ${host_mem} RAM)${NC}"
  fi
@@ -492,6 +494,54 @@ if [[ "$web_found" -eq 0 ]]; then
  echo -e "${ORANGE}=======================================${NC}"
  echo "Neither nginx nor apache2 is active"
 fi
+
+echo -e "${ORANGE}=======================================${NC}"
+echo -e "${ORANGE}================ Disks ================${NC}"
+echo -e "${ORANGE}=======================================${NC}"
+# Real local filesystems only: no tmpfs/snap/overlay noise, no /boot or /boot/efi.
+df -h -l --output=target,size,used,avail,pcent \
+   -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
+ | awk "$AWK_SHADE"'
+     NR == 1 { next }
+     $1 ~ /^\/(boot|snap)(\/|$)/ { next }
+     { n++; m[n] = $1; s[n] = $2; u[n] = $3; f[n] = $4; p[n] = $5; gsub(/%/, "", p[n])
+       if (length($1) > w) w = length($1) }
+     END {
+       if (w < 5) w = 5
+       printf "%-" w "s %7s %7s %7s %5s\n", "Mount", "Size", "Used", "Free", "Use"
+       line = ""; for (i = 0; i < w + 30; i++) line = line "-"
+       print line
+       for (i = 1; i <= n; i++)
+         printf "\033[0;32m%-" w "s\033[0m %7s %7s %7s %s\n", m[i], s[i], u[i], f[i], pct(p[i] + 0)
+     }'
+
+echo -e "${ORANGE}=======================================${NC}"
+echo -e "${ORANGE}========== Current processes ==========${NC}"
+echo -e "${ORANGE}=======================================${NC}"
+host_cpus=$(nproc)
+# top prints two frames 5 s apart; the second one holds the CPU usage averaged
+# over those 5 s (the first one is since-boot and useless).
+echo -e "${ORANGE}Top 5 by CPU (averaged over 5 s, 100% = one full core of ${host_cpus})${NC}"
+printf "%7s %-12s %6s  %s\n" "PID" "User" "CPU" "Command"
+echo "--------------------------------------------"
+LC_ALL=C top -b -n 2 -d 5 -o %CPU -w 512 2>/dev/null | awk -v ncpu="$host_cpus" "$AWK_SHADE"'
+    /^top -/ { frame++; hdr = 0; next }
+    frame == 2 && $1 == "PID" { hdr = 1; next }
+    frame == 2 && hdr && NF >= 12 && n < 5 {
+        n++
+        cmd = $12; for (i = 13; i <= NF; i++) cmd = cmd " " $i
+        printf "%7s %-12s \033[38;5;%sm%5.1f%%\033[0m  %s\n", $1, $2, shade($9 / ncpu), $9, cmd
+    }'
+
+echo -e "${ORANGE}Top 5 by RAM (resident memory)${NC}"
+printf "%7s %-12s %8s %5s  %s\n" "PID" "User" "RAM" "Share" "Command"
+echo "--------------------------------------------"
+ps -eo pid=,user:12=,rss=,pmem=,comm= --sort=-rss | head -n 5 | awk "$AWK_SHADE"'{
+    kb = $3
+    size = (kb >= 1048576) ? sprintf("%.1fG", kb / 1048576) : sprintf("%.0fM", kb / 1024)
+    cmd = $5; for (i = 6; i <= NF; i++) cmd = cmd " " $i
+    printf "%7s %-12s %8s %s  %s\n", $1, $2, size, pct($4 + 0), cmd
+}'
 
 echo ""
 echo ""
